@@ -1,0 +1,111 @@
+Imports System.IO
+
+Sub Terminate_9204()
+  Try
+    ' Percorsi anonimizzati per pubblicazione su GitHub
+    ' (le variabili globali devono essere già state modificate come nel file precedente)
+
+    If Not Directory.Exists(strImportatiDir) Then Directory.CreateDirectory(strImportatiDir)
+
+    Dim fileDaImportare As String = Path.Combine(strDaImportareDir, "XRay.csv")
+
+    If nVariazioni = 0 Then
+      ScriviLogCustom(strLogPath, "Nessuna variazione da scrivere, salto generazione del file XRay.")
+    End If
+
+    If File.Exists(fileDaImportare) Then
+      Dim timestamp As String = Now.ToString("yyyyMMdd_HHmm")
+      Dim fileNameWithTimestamp As String = "XRay_" & timestamp & ".csv"
+      Dim destinazioneImportati As String = Path.Combine(strImportatiDir, fileNameWithTimestamp)
+
+      If File.Exists(destinazioneImportati) Then
+        ScriviLogCustom(Path.Combine(strLogDir, "log_importa.txt"), "File già esistente: " & fileNameWithTimestamp & ", salto copia.")
+      Else
+        File.Copy(fileDaImportare, destinazioneImportati, True)
+        ScriviLogCustom(Path.Combine(strLogDir, "log_importa.txt"), "Copiato XRay.csv in IMPORTATO_BUSINESS come: " & fileNameWithTimestamp)
+
+        Dim lines_array() As String = File.ReadAllLines(destinazioneImportati, System.Text.Encoding.UTF8)
+        Dim lines_post As New List(Of String)(lines_array)
+        Dim nuoveLinee As New List(Of String)
+
+        nuoveLinee.Add(lines_post(0).Trim() & ";EsistenzaPostImport;ImpegnatoPostImport;PrenotatoPostImport;DisponibilitaPostImport;DisponibilitaNettaPostImport")
+
+        For i As Integer = 1 To lines_post.Count - 1
+          Dim rigaPulita As String = lines_post(i).Trim()
+          Dim campi As String() = rigaPulita.Split(";"c)
+
+          If campi.Length >= 1 AndAlso Not String.IsNullOrEmpty(campi(0).Trim()) Then
+            Dim articolo As String = campi(0).Trim()
+
+            Dim esistenzaPost As Decimal = 0D
+            Dim impegnatoPost As Decimal = 0D
+            Dim prenotatoPost As Decimal = 0D
+            Dim ordinatoPost As Decimal = 0D
+            Dim disponibilitaPost As Decimal = 0D
+            Dim disponibilitaNettaPost As Decimal = 0D
+
+            Dim dttTmp2 As New DataTable
+            Dim dttTmpCheck2 As New DataTable
+            Dim ocldBase2 As New CLD__BASE
+            ocldBase2.Init(oApp)
+
+            Dim strSQLCheck2 As String = "SELECT * FROM artico WHERE codditt = 'CSE' AND ar_codart = " & CStrSQL(articolo)
+            dttTmpCheck2 = ocldBase2.OpenRecordset(strSQLCheck2, CLE__APP.DBTIPO.DBAZI)
+
+            If dttTmpCheck2.Rows.Count > 0 Then
+              Dim strSQL2 As String = "SELECT ap_esist, ap_prenot, ap_impeg, ap_ordin FROM ARTPRO WHERE ap_codart=" & CStrSQL(articolo)
+              dttTmp2 = ocldBase2.OpenRecordset(strSQL2, CLE__APP.DBTIPO.DBAZI)
+
+              If dttTmp2.Rows.Count > 0 Then
+                esistenzaPost = NTSCDec(dttTmp2.Rows(0)!ap_esist)
+                impegnatoPost = NTSCDec(dttTmp2.Rows(0)!ap_impeg)
+                prenotatoPost = NTSCDec(dttTmp2.Rows(0)!ap_prenot)
+                ordinatoPost = NTSCDec(dttTmp2.Rows(0)!ap_ordin)
+
+                disponibilitaPost = esistenzaPost + ordinatoPost - impegnatoPost
+                disponibilitaNettaPost = esistenzaPost - prenotatoPost
+              End If
+            Else
+              ScriviLogCustom(Path.Combine(strLogDir, "log_importa.txt"), "Articolo non esistente: " & articolo)
+            End If
+
+            nuoveLinee.Add(
+              rigaPulita & ";" &
+              FormatDecimalForCSV(esistenzaPost) & ";" &
+              FormatDecimalForCSV(impegnatoPost) & ";" &
+              FormatDecimalForCSV(prenotatoPost) & ";" &
+              FormatDecimalForCSV(disponibilitaPost) & ";" &
+              FormatDecimalForCSV(disponibilitaNettaPost)
+            )
+
+          Else
+            ScriviLogCustom(Path.Combine(strLogDir, "log_importa.txt"), "Riga malformata saltata alla posizione " & i & ": " & rigaPulita)
+          End If
+        Next
+
+        File.WriteAllLines(destinazioneImportati, nuoveLinee.ToArray(), System.Text.Encoding.UTF8)
+        ScriviLogCustom(Path.Combine(strLogDir, "log_importa.txt"), "Aggiunta colonne completata con successo.")
+      End If
+
+      Using emptyWriter As New StreamWriter(fileDaImportare, False, System.Text.Encoding.UTF8)
+        emptyWriter.WriteLine("CodiceArticolo;QuantitaVariazione;EsistenzaPreImport")
+      End Using
+      ScriviLogCustom(Path.Combine(strLogDir, "log_importa.txt"), "Ricreato XRay.csv vuoto in da_importare")
+    End If
+
+    For Each filePath As String In Directory.GetFiles(strImportatiDir, "XRay_*.csv")
+      Try
+        Dim lines_3() As String = File.ReadAllLines(filePath, System.Text.Encoding.UTF8)
+        If lines_3.Length <= 1 Then
+          File.Delete(filePath)
+          ScriviLogCustom(strLogPath, "Eliminato file vuoto: " & Path.GetFileName(filePath))
+        End If
+      Catch ex As Exception
+        ScriviLogCustom(strLogPath, "Errore durante pulizia file " & Path.GetFileName(filePath) & ": " & ex.Message)
+      End Try
+    Next
+
+  Catch ex As Exception
+    ScriviLogCustom(strLogPath, "Errore eseguendo la procedura 'Terminate_9204':" & ex.Message)
+  End Try
+End Sub

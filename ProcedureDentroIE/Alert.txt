@@ -1,0 +1,160 @@
+Imports System.IO
+Imports System.Collections.Generic
+
+' Variabili globali percorso (versione sicura per GitHub)
+Public strWorkingPath As String = "C:\Percorso\Progetto\Risultati"
+Public strImportatiDir As String = Path.Combine(strWorkingPath, "IMPORTATO_BUSINESS")
+Public strLogPath As String = "C:\Percorso\Progetto\Log\log.txt"
+Public strMessage As String = ""
+
+Function InvioMail(ByRef oApp As CLE__APP, ByVal strCodditt As String, ByRef dttMsgOutParam As DataTable) As Boolean
+    ' Variabili locali
+    Dim cartellaImportati As String = strImportatiDir
+    Dim strMessage As String = String.Empty
+    Dim giornoPrecedente As DateTime = DateTime.Now.AddDays(-1)
+    Dim dataTarget As String = giornoPrecedente.ToString("yyyyMMdd")
+    Dim tuttiIFile As String() = Nothing
+    Dim ultimoFile As String = String.Empty
+    Dim ultimoTimestamp As String = String.Empty
+    Dim headerAtteso As String = "CodiceArticolo;QuantitaVariazione;EsistenzaPreImport;EsistenzaPostImport;ImpegnatoPostImport;PrenotatoPostImport;DisponibilitaPostImport;DisponibilitaNettaPostImport"
+    Dim righeFile() As String = Nothing
+    Dim righeValidazione() As String = Nothing
+    Dim righeFinali() As String = Nothing
+    Dim righeEmail() As String = Nothing
+    Dim info As FileInfo = Nothing
+    Dim fileValido As Boolean = True
+    Dim motivoScarto As String = String.Empty
+    Dim headerFile As String = String.Empty
+    Dim nomeFile As String = String.Empty
+    Dim parteData As String = String.Empty
+    Dim parteOrario As String = String.Empty
+    Dim timestampCompleto As String = String.Empty
+    Dim numeroRigheDati As Integer = 0
+    Dim numeroArticoli As Integer = 0
+    Dim nomeFileEmail As String = String.Empty
+    Dim dataElaborazione As String = String.Empty
+    Dim messaggioEmail As String = String.Empty
+
+    Try
+        ScriviLogCustom(strLogPath, "=== INIZIO PROCESSO INVIO MAIL REPORT VARIAZIONI ===")
+        ScriviLogCustom(strLogPath, "Cartella target: " & cartellaImportati)
+
+        If Not Directory.Exists(cartellaImportati) Then
+            ScriviLogCustom(strLogPath, "ERRORE : Cartella non trovata: " & cartellaImportati)
+            Return False
+        End If
+
+        ScriviLogCustom(strLogPath, "Cartella IMPORTATO_BUSINESS verificata e trovata")
+
+        ' === Fase 2: Pulizia file non validi ===
+        ScriviLogCustom(strLogPath, "Inizio pulizia file non validi...")
+        Dim fileEliminati As Integer = 0
+
+        For Each filePath As String In Directory.GetFiles(cartellaImportati, "*.csv")
+            Try
+                info = New FileInfo(filePath)
+                fileValido = True
+                motivoScarto = String.Empty
+
+                If info.Length = 0 Then
+                    fileValido = False
+                    motivoScarto = "File completamente vuoto (0 bytes)"
+                Else
+                    righeFile = File.ReadAllLines(filePath, System.Text.Encoding.UTF8)
+                    If righeFile Is Nothing OrElse righeFile.Length = 0 Then
+                        fileValido = False
+                        motivoScarto = "File senza contenuto (nessuna riga)"
+                    ElseIf righeFile.Length = 1 Then
+                        fileValido = False
+                        motivoScarto = "File con solo header, nessuna riga dati"
+                    ElseIf righeFile.Length >= 2 Then
+                        headerFile = righeFile(0).Trim()
+                        If headerFile <> headerAtteso Then
+                            fileValido = False
+                            motivoScarto = "Header non corretto"
+                        ElseIf String.IsNullOrWhiteSpace(righeFile(1)) Then
+                            fileValido = False
+                            motivoScarto = "Prima riga dati vuota"
+                        End If
+                    End If
+                End If
+
+                If Not fileValido Then
+                    File.Delete(filePath)
+                    fileEliminati += 1
+                    ScriviLogCustom(strLogPath, "ELIMINATO file non valido: " & Path.GetFileName(filePath))
+                End If
+
+            Catch exDel As Exception
+                ' Ignora errori
+            End Try
+        Next
+
+        ScriviLogCustom(strLogPath, "Pulizia completata. File eliminati: " & fileEliminati)
+
+        ' === Fase 3 e 4: Ricerca file giorno precedente ===
+        dataElaborazione = giornoPrecedente.ToString("dd/MM/yyyy")
+        ScriviLogCustom(strLogPath, "=== RICERCA FILE DEL GIORNO PRECEDENTE ===")
+
+        tuttiIFile = Directory.GetFiles(cartellaImportati, "XRay_*.csv")
+        Dim fileValidoPerNome As New List(Of String)
+        Dim ultimaDataOra As DateTime = DateTime.MinValue
+
+        For Each filePath As String In tuttiIFile
+            Dim nomeFileCorrente As String = Path.GetFileNameWithoutExtension(filePath)
+            Dim parts() As String = nomeFileCorrente.Split("_"c)
+
+            If parts.Length = 3 Then
+                parteData = parts(1)
+                parteOrario = parts(2)
+
+                If parteOrario.Length = 4 AndAlso IsNumeric(parteOrario) Then
+                    Dim dataOraStr As String = parteData & parteOrario
+                    Dim dtFile As DateTime
+
+                    If DateTime.TryParseExact(dataOraStr, "yyyyMMddHHmm", Nothing, Globalization.DateTimeStyles.None, dtFile) Then
+                        If dtFile.Date = giornoPrecedente.Date Then
+                            fileValidoPerNome.Add(filePath)
+                            If dtFile > ultimaDataOra Then
+                                ultimaDataOra = dtFile
+                                ultimoFile = filePath
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        Next
+
+        tuttiIFile = fileValidoPerNome.ToArray()
+
+        If tuttiIFile.Length = 0 Then
+            strMessage = "NESSUN FILE XRay_*.csv trovato dopo la pulizia"
+        Else
+            nomeFileEmail = Path.GetFileName(ultimoFile)
+            strMessage = "Allegato CSV con elenco variazioni del " & dataElaborazione
+        End If
+
+        dttMsgOutParam.Rows.Add(dttMsgOutParam.NewRow())
+        dttMsgOutParam.Rows(dttMsgOutParam.Rows.Count - 1)!codditt = strCodditt
+        dttMsgOutParam.Rows(dttMsgOutParam.Rows.Count - 1)!strMsg = strMessage
+        dttMsgOutParam.Rows(dttMsgOutParam.Rows.Count - 1)!strParam1 = ultimoFile
+        dttMsgOutParam.Rows(dttMsgOutParam.Rows.Count - 1).AcceptChanges()
+
+        Return True
+
+    Catch ex As Exception
+        ' Gestione errori
+    Finally
+        ScriviLogCustom(strLogPath, "=== FINE PROCESSO INVIO MAIL ===")
+    End Try
+End Function
+
+Private Sub ScriviLogCustom(ByVal strLogPath As String, ByVal messaggio As String)
+    Try
+        Using writer As New StreamWriter(strLogPath, True, System.Text.Encoding.UTF8)
+            writer.WriteLine(Now.ToString("yyyy-MM-dd HH:mm:ss") & " - " & messaggio)
+        End Using
+    Catch
+        ' Ignora errori
+    End Try
+End Sub

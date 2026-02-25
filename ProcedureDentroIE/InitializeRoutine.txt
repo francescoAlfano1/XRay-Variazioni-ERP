@@ -1,0 +1,497 @@
+Imports System.IO
+Imports System.Collections.Generic
+
+Imports System.IO
+Imports System.Collections.Generic
+
+' === VARIABILI GLOBALI PERCORSI (VERSIONE SICURA PER GITHUB) ===
+Public strSourcePath As String = "C:\Percorso\Progetto\monitora"
+Public strWorkingPath As String = "C:\Percorso\Progetto\risultati"
+Public strOldDir As String = strSourcePath & "\OLD"
+
+Public strLogDir As String = strWorkingPath & "\LOG"
+Public strDaImportareDir As String = strWorkingPath & "\da_importare"
+Public strImportatiDir As String = strWorkingPath & "\IMPORTATO_BUSINESS"
+
+Public strLogPath As String = strLogDir & "\log.txt"
+Public strOutputCSV As String = strWorkingPath & "\XRay.csv"
+
+Public nVariazioni As Integer = 0
+
+
+'elabora tutti i file CSV contenuti in una cartella sorgente (strSourcePath), estraendo dati di variazione quantità relative per ogni specifico articolo
+'Aggrega le variazioni per codice articolo, generando un rispettivo file CSV aggregato, pronto per essere dato in pasto all' import/export
+'Già qui vengono gestite inoltre le routine di  spostamento e la pulizia dei file nelle cartelle di lavoro (OLD, LOG, IMPORTATO_BUSINESS, da_importare).
+
+'NOTA BENE
+'dictVariazioni:è una struttura dizionario che aggrega per ogni codice articolo una somma di variazioni e la lista dei file con le relative variazioni.
+' con questo tengo traccia di tutto in maniera ordinata
+
+  Sub Initialize_9204()
+    Dim objWriter As StreamWriter = Nothing
+    Dim objReader As StreamReader = Nothing
+    ' Utilizzo dizionario compatibile con .NET Framework più vecchio
+    Dim dictVariazioni As New Dictionary(Of String, VariazioneDettaglio)
+    Dim strLog As String = ""
+
+    ' === MODIFICA: Timestamp solo giornaliero per file dettaglio ===
+    Dim dataOdierna As String = Now.ToString("yyyyMMdd")
+    Dim nomeBaseDettaglio As String = "LogDettaglioVariazioni_" & dataOdierna
+    Dim strLogDettaglioPath As String = strLogDir & "\" & nomeBaseDettaglio & ".csv"
+
+    ' === NUOVA IMPLEMENTAZIONE: Gestione counter per evitare sovrascrittura file dettaglio ===
+    Dim counterDettaglio As Integer = 1
+    While File.Exists(strLogDettaglioPath)
+      strLogDettaglioPath = strLogDir & "\" & nomeBaseDettaglio & "_" & counterDettaglio & ".csv"
+      counterDettaglio += 1
+    End While
+
+    ' === NUOVA IMPLEMENTAZIONE: Cartella per file coerenti con data odierna ===
+    ' Creo nome cartella per file coerenti raggruppati per data di elaborazione
+    Dim dirVariazioniOdierne As String = strOldDir & "\variazionXray" & dataOdierna
+
+    ' Se necessario, creo le cartelle di lavoro
+    If Not Directory.Exists(strLogDir) Then Directory.CreateDirectory(strLogDir)
+    If Not Directory.Exists(strOldDir) Then Directory.CreateDirectory(strOldDir)
+    If Not Directory.Exists(strImportatiDir) Then Directory.CreateDirectory(strImportatiDir)
+    If Not Directory.Exists(strWorkingPath) Then Directory.CreateDirectory(strWorkingPath)
+    If Not Directory.Exists(strDaImportareDir) Then Directory.CreateDirectory(strDaImportareDir)
+
+    ' === NUOVA IMPLEMENTAZIONE: Creo cartella variazioni odierne se non esiste ===
+    If Not Directory.Exists(dirVariazioniOdierne) Then
+      Directory.CreateDirectory(dirVariazioniOdierne)
+      ScriviLogCustom(strLogPath, "Creata cartella per variazioni odierne: " & dirVariazioniOdierne)
+    End If
+
+    ' Assicuriamoci che XRay.csv sia sempre presente e VUOTO in da_importare all'avvio
+    ' Questo garantisce uno stato pulito per ogni elaborazione e previene dati obsoleti per l'ERP
+    Dim xrayDaImportare As String = Path.Combine(strDaImportareDir, "XRay.csv")
+    Using emptyWriter As New StreamWriter(xrayDaImportare, False, System.Text.Encoding.UTF8)
+      emptyWriter.WriteLine("CodiceArticolo;QuantitaVariazione;EsistenzaPreImport")
+    End Using
+    ScriviLogCustom(strLogPath, "Inizializzato XRay.csv vuoto in da_importare per trigger ERP")
+
+    ' Elimino i file di log più vecchi di 7 giorni
+    Dim logCutoffDate As DateTime = Now.AddDays(-7)
+    For Each oldLogFile As String In Directory.GetFiles(strLogDir)
+      If File.GetCreationTime(oldLogFile) <= logCutoffDate Then
+        Try
+          File.Delete(oldLogFile)
+        Catch exDel As Exception
+          ' Se fallisce la cancellazione, ignoro l'errore
+        End Try
+      End If
+    Next
+
+    Try
+      ScriviLogCustom(strLogPath, "Inizio elaborazione cartella: " & strSourcePath)
+      Dim lines() As String = Nothing
+
+      ' Ciclo su ogni file CSV nella cartella sorgente
+      For Each strFile As String In Directory.GetFiles(strSourcePath, "*.csv")
+        Dim fileName As String = Path.GetFileName(strFile)
+        ScriviLogCustom(strLogPath, "Elaboro file: " & fileName)
+        lines = File.ReadAllLines(strFile)
+
+        ' Se il file è vuoto o incompleto, lo segnalo e lo sposto in cartella struttura_errata
+        If lines.Length < 2 Then
+          ScriviLogCustom(strLogPath, "File vuoto o incompleto: " & fileName)
+          ' === NUOVA IMPLEMENTAZIONE: Sposto file vuoti/incompleti in cartella struttura_errata ===
+          SpostaFileStrutturaErrata(strFile, fileName, "File vuoto o incompleto")
+          Continue For
+        End If
+
+        ' MODIFICA: Verifica header con nuova struttura CSV (REELID,ITEMCODE,QT_INITIAL,QT_VARIATION,QTY_FINAL,USERNAME)
+        Dim dataLineIndex As Integer = 1
+        If lines(0).ToUpper().Contains("REELID") AndAlso lines(0).ToUpper().Contains("ITEMCODE") AndAlso lines(0).ToUpper().Contains("QT_VARIATION") AndAlso lines(0).ToUpper().Contains("USERNAME") Then
+          dataLineIndex = 1
+        Else
+          dataLineIndex = 0
+        End If
+
+        If lines.Length <= dataLineIndex Then
+          ScriviLogCustom(strLogPath, "File senza dati validi: " & fileName)
+          ' === NUOVA IMPLEMENTAZIONE: Sposto file senza dati validi in cartella struttura_errata ===
+          SpostaFileStrutturaErrata(strFile, fileName, "File senza dati validi")
+          Continue For
+        End If
+
+        Dim dataLine As String() = lines(dataLineIndex).Split(","c)
+
+        ' MODIFICA: Controllo formato aggiornato per 6 colonne invece di 5 (aggiunta USERNAME)
+        If dataLine.Length < 6 Then
+          ScriviLogCustom(strLogPath, "Formato non valido (colonne insufficienti): " & fileName & " - Colonne trovate: " & dataLine.Length)
+          ' === NUOVA IMPLEMENTAZIONE: Sposto file con formato non valido in cartella struttura_errata ===
+          SpostaFileStrutturaErrata(strFile, fileName, "Formato non valido - Colonne: " & dataLine.Length)
+          Continue For
+        End If
+
+        ' MODIFICA: Verifica se USERNAME (colonna 5, indice 5) è valorizzato - se sì, esclude il file
+        Dim username As String = ""
+        If dataLine.Length > 5 Then
+          username = dataLine(5).Trim().Replace("""", "")
+        End If
+
+        If Not String.IsNullOrEmpty(username) Then
+          ScriviLogCustom(strLogPath, "File con USERNAME valorizzato (" & username & ") - ESCLUSO: " & fileName)
+          ' === MODIFICA: Timestamp solo giornaliero per cartelle esclusione ===
+          Dim dirEsclusione As String = strOldDir & "\da_escludere_" & dataOdierna
+          If Not Directory.Exists(dirEsclusione) Then Directory.CreateDirectory(dirEsclusione)
+          Dim destPathEsclusione As String = Path.Combine(dirEsclusione, fileName)
+          Dim counterEsclusione As Integer = 1
+          While File.Exists(destPathEsclusione)
+            destPathEsclusione = Path.Combine(dirEsclusione, Path.GetFileNameWithoutExtension(fileName) & "_" & counterEsclusione & Path.GetExtension(fileName))
+            counterEsclusione += 1
+          End While
+          File.Move(strFile, destPathEsclusione)
+          ScriviLogCustom(strLogPath, "Sposto in da_escludere: " & destPathEsclusione)
+          Continue For
+        End If
+
+        Dim itemCode As String = dataLine(1).Trim().Replace("""", "")
+        Dim qtVariation As String = dataLine(3).Trim().Replace("""", "")
+        Dim variazione As Decimal = 0D
+
+        If Not Decimal.TryParse(qtVariation, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, variazione) Then
+          ScriviLogCustom(strLogPath, "QTVARIATION non valida in " & fileName & " - Valore: " & qtVariation)
+          ' === NUOVA IMPLEMENTAZIONE: Sposto file con QTVARIATION non valida in cartella struttura_errata ===
+          SpostaFileStrutturaErrata(strFile, fileName, "QTVARIATION non valida: " & qtVariation)
+          Continue For
+        End If
+
+        ' Se la variazione è zero, sposto il file in una sottocartella di OLD e lo segnalo
+        If variazione = 0D Then
+          ScriviLogCustom(strLogPath, "QTVARIATION pari a 0 in " & fileName & ". Probabile errore nel processo esterno.")
+          ' === MODIFICA: Timestamp solo giornaliero per cartelle verifica ===
+          Dim dirVerifica As String = strOldDir & "\FilesDaVerificare_" & dataOdierna
+          If Not Directory.Exists(dirVerifica) Then Directory.CreateDirectory(dirVerifica)
+          Dim destPathVerifica As String = Path.Combine(dirVerifica, fileName)
+          Dim counterVerifica As Integer = 1
+          While File.Exists(destPathVerifica)
+            destPathVerifica = Path.Combine(dirVerifica, Path.GetFileNameWithoutExtension(fileName) & "_" & counterVerifica & Path.GetExtension(fileName))
+            counterVerifica += 1
+          End While
+          File.Move(strFile, destPathVerifica)
+          ScriviLogCustom(strLogPath, "Sposto in FilesDaVerificare: " & destPathVerifica)
+          Continue For
+        End If
+
+        ' Aggiorno il dizionario salvando anche la variazione individuale
+        If dictVariazioni.ContainsKey(itemCode) Then
+          Dim vecchiaVariazione As VariazioneDettaglio = dictVariazioni(itemCode)
+          vecchiaVariazione.Variazione = vecchiaVariazione.Variazione + variazione
+          vecchiaVariazione.FileDetails.Add(New FileDettaglio(fileName, variazione))
+        Else
+          Dim nuovaVariazione As New VariazioneDettaglio()
+          nuovaVariazione.Variazione = variazione
+          nuovaVariazione.FileDetails.Add(New FileDettaglio(fileName, variazione))
+          dictVariazioni.Add(itemCode, nuovaVariazione)
+        End If
+
+        ' === MODIFICA IMPLEMENTAZIONE: Sposto file coerenti in sottocartella con data odierna ===
+        ' Invece di spostare direttamente in OLD, sposto nella cartella variazionXray + data odierna
+        Dim destPath As String = Path.Combine(dirVariazioniOdierne, fileName)
+        Dim counter As Integer = 1
+        While File.Exists(destPath)
+          destPath = Path.Combine(dirVariazioniOdierne, Path.GetFileNameWithoutExtension(fileName) & "_" & counter & Path.GetExtension(fileName))
+          counter += 1
+        End While
+        File.Move(strFile, destPath)
+        ScriviLogCustom(strLogPath, "Sposto file coerente in cartella data odierna: " & destPath)
+      Next
+
+      ' === NUOVA IMPLEMENTAZIONE: Pulizia ricorsiva completa cartella OLD ===
+      ' Elimino tutti i file e cartelle più vecchi di 7 giorni dalla cartella OLD e sue sottocartelle
+      Dim cutoffDate As DateTime = Now.AddDays(-7)
+      ScriviLogCustom(strLogPath, "Inizio pulizia ricorsiva cartella OLD per file/cartelle più vecchi di 7 giorni")
+      PulisciCartollaRicorsiva(strOldDir, cutoffDate)
+
+      ' Pulizia automatica della cartella IMPORTATO_BUSINESS
+      Dim importatiCutoffDate As DateTime = Now.AddDays(-7)
+      If Directory.Exists(strImportatiDir) Then
+        For Each oldImportato As String In Directory.GetFiles(strImportatiDir)
+          If File.GetCreationTime(oldImportato) <= importatiCutoffDate Then
+            Try
+              File.Delete(oldImportato)
+              ScriviLogCustom(strLogPath, "Elimino file vecchio da IMPORTATO_BUSINESS: " & Path.GetFileName(oldImportato))
+            Catch exDel As Exception
+              ScriviLogCustom(strLogPath, "Errore eliminazione file IMPORTATO_BUSINESS " & Path.GetFileName(oldImportato) & ": " & exDel.Message)
+            End Try
+          End If
+        Next
+      End If
+
+      ' === RIMOSSA: Pulizia della cartella da_importare ===
+      ' La cartella da_importare NON deve essere pulita - contiene XRay.csv per l'ERP
+
+      ' Ordino i risultati manualmente (senza LINQ) per valore di variazione crescente
+      Dim vociOrdinate As New List(Of KeyValuePair(Of String, VariazioneDettaglio))
+      For Each kvp As KeyValuePair(Of String, VariazioneDettaglio) In dictVariazioni
+        vociOrdinate.Add(kvp)
+      Next
+
+      ' Ordinamento manuale con bubble sort
+      For i As Integer = 0 To vociOrdinate.Count - 1
+        For j As Integer = i + 1 To vociOrdinate.Count - 1
+          If vociOrdinate(i).Value.Variazione > vociOrdinate(j).Value.Variazione Then
+            Dim temp As KeyValuePair(Of String, VariazioneDettaglio) = vociOrdinate(i)
+            vociOrdinate(i) = vociOrdinate(j)
+            vociOrdinate(j) = temp
+          End If
+        Next
+      Next
+
+      ScriviLogCustom(strLogPath, "Numero voci da scrivere: " & vociOrdinate.Count.ToString())
+
+      ' Verifico se XRay.csv esiste in da_importare e lo apro per scriverci le variazioni aggregate
+      ScriviLogCustom(strLogPath, "Verifico esistenza di XRay.csv in da_importare e procedo alla scrittura")
+      If File.Exists(xrayDaImportare) Then
+        ScriviLogCustom(strLogPath, "XRay.csv trovato in da_importare, procedo con l'aggiornamento")
+        objWriter = New StreamWriter(xrayDaImportare, False, System.Text.Encoding.UTF8)
+      Else
+        ScriviLogCustom(strLogPath, "XRay.csv non trovato in da_importare, lo creo")
+        objWriter = New StreamWriter(xrayDaImportare, False, System.Text.Encoding.UTF8)
+      End If
+
+      objWriter.WriteLine("CodiceArticolo;QuantitaVariazione;EsistenzaPreImport")
+
+      For Each kvp As KeyValuePair(Of String, VariazioneDettaglio) In vociOrdinate
+        Try
+          ScriviLogCustom(strLogPath, "Inizio verifiche per ogni articolo per il quale ho rilevato variazioni: " & kvp.Key)
+          Dim articolo As String = kvp.Key
+          Dim esistenzaPreImport As Decimal = 0D
+          Dim dttTmp As New DataTable
+          Dim dttTmpCheck As New DataTable
+          Dim ocldBase As New CLD__BASE
+          ocldBase.Init(oApp)
+
+          Dim strSQLCheck As String = "SELECT * FROM artico WHERE codditt = 'CSE' AND ar_codart = " & CStrSQL(articolo)
+          dttTmpCheck = ocldBase.OpenRecordset(strSQLCheck, CLE__APP.DBTIPO.DBAZI)
+
+          If Not dttTmpCheck.Rows.Count > 0 Then
+            ScriviLogCustom(strLogPath, "L'articolo: " & articolo & " non esiste")
+          Else
+            Dim strSQL As String = "SELECT ap_esist from ARTPRO where ap_codart=" & CStrSQL(articolo)
+            ScriviLogCustom(strLogPath, "Disponibilità attuale per l'articolo: " & articolo)
+            dttTmp = ocldBase.OpenRecordset(strSQL, CLE__APP.DBTIPO.DBAZI)
+
+            If dttTmp.Rows.Count > 0 Then
+              esistenzaPreImport = NTSCDec(dttTmp.Rows(0)!ap_esist)
+              esistenzaPreImport =FormatDecimalForCSV(esistenzaPreImport)
+            Else
+              ScriviLogCustom(strLogPath, "Nessuna disponibilità trovata per articolo: " & articolo)
+            End If
+          End If
+
+          ScriviLogCustom(strLogPath, "Scrivo: " & articolo & ";" & kvp.Value.Variazione.ToString() & ";" & esistenzaPreImport.ToString())
+          objWriter.WriteLine(articolo & ";" & kvp.Value.Variazione.ToString().Replace(",", ".") & ";" & esistenzaPreImport.ToString().Replace(",", "."))
+
+        Catch ex As Exception
+          ScriviLogCustom(strLogPath, "Errore nel ciclo per articolo " & kvp.Key & ": " & ex.Message)
+        End Try
+      Next
+
+      objWriter.Close()
+
+      ' Genero il file di dettaglio usando le variazioni individuali
+      Dim dettagli As New List(Of DettaglioCompleto)
+      For Each kvp As KeyValuePair(Of String, VariazioneDettaglio) In vociOrdinate
+        For Each fileDetail As FileDettaglio In kvp.Value.FileDetails
+          dettagli.Add(New DettaglioCompleto(kvp.Key, fileDetail.FileName, fileDetail.IndividualVariation))
+        Next
+      Next
+
+      ' Ordinamento manuale dei dettagli per variazione aggregata dell'articolo  ' DEPRECATO NELLA TERMINATE DOVE HO INSERITO LA NUOVA LOGICA
+      For i As Integer = 0 To dettagli.Count - 1
+        For j As Integer = i + 1 To dettagli.Count - 1
+          Dim variazioneI As Decimal = dictVariazioni(dettagli(i).CodiceArticolo).Variazione
+          Dim variazioneJ As Decimal = dictVariazioni(dettagli(j).CodiceArticolo).Variazione
+          If variazioneI > variazioneJ Then
+            Dim temp As DettaglioCompleto = dettagli(i)
+            dettagli(i) = dettagli(j)
+            dettagli(j) = temp
+          End If
+        Next
+      Next
+
+      Dim dettaglioWriter As New StreamWriter(strLogDettaglioPath, False, System.Text.Encoding.UTF8)
+      dettaglioWriter.WriteLine("CodiceArticolo;File;QuantitaVariazione")
+      For Each det As DettaglioCompleto In dettagli
+        dettaglioWriter.WriteLine(det.CodiceArticolo & ";" & det.FileName & ";" & det.Variazione.ToString().Replace(",", "."))
+      Next
+      dettaglioWriter.Close()
+
+      ScriviLogCustom(strLogPath, "Ho creato il file di dettaglio: " & strLogDettaglioPath)
+
+      ' Copio XRay.csv in IMPORTATO_BUSINESS con timestamp e ricreo file vuoto in da_importare
+      If File.Exists(xrayDaImportare) Then
+        Dim timestampedFileName As String = "XRay_" & Now.ToString("yyyyMMdd_HHmmss") & ".csv"
+        Dim destinazioneImportato As String = Path.Combine(strImportatiDir, timestampedFileName)
+        File.Copy(xrayDaImportare, destinazioneImportato, True)
+        ScriviLogCustom(strLogPath, "Copiato XRay.csv in IMPORTATO_BUSINESS come: " & timestampedFileName)
+        
+     End If
+
+    Catch ex As Exception
+      ScriviLogCustom(strLogPath, "Errore eseguendo la procedura 'Initialize_9204':" & ex.Message)
+    Finally
+      If objWriter IsNot Nothing Then objWriter.Close()
+      If objReader IsNot Nothing Then objReader.Close()
+    End Try
+  End Sub
+
+  ' === NUOVA IMPLEMENTAZIONE: Funzione per gestire file con struttura errata ===
+  ' Sposta i file malformati nella cartella struttura_errata con motivo dell'errore
+  Private Sub SpostaFileStrutturaErrata(ByVal filePath As String, ByVal fileName As String, ByVal motivo As String)
+    Try
+      Dim dataOdierna As String = Now.ToString("yyyyMMdd")
+      Dim dirStrutturaErrata As String = strOldDir & "\struttura_errata_" & dataOdierna
+
+      If Not Directory.Exists(dirStrutturaErrata) Then
+        Directory.CreateDirectory(dirStrutturaErrata)
+        ScriviLogCustom(strLogPath, "Creata cartella per file con struttura errata: " & dirStrutturaErrata)
+      End If
+
+      Dim destPathStrutturaErrata As String = Path.Combine(dirStrutturaErrata, fileName)
+      Dim counterStrutturaErrata As Integer = 1
+      While File.Exists(destPathStrutturaErrata)
+        destPathStrutturaErrata = Path.Combine(dirStrutturaErrata, Path.GetFileNameWithoutExtension(fileName) & "_" & counterStrutturaErrata & Path.GetExtension(fileName))
+        counterStrutturaErrata += 1
+      End While
+
+      File.Move(filePath, destPathStrutturaErrata)
+      ScriviLogCustom(strLogPath, "Sposto file con struttura errata (" & motivo & "): " & destPathStrutturaErrata)
+
+    Catch ex As Exception
+      ScriviLogCustom(strLogPath, "Errore spostamento file struttura errata " & fileName & ": " & ex.Message)
+    End Try
+  End Sub
+
+  ' === NUOVA IMPLEMENTAZIONE: Funzione per pulizia ricorsiva completa ===
+  ' Pulisce ricorsivamente tutti i file e cartelle più vecchi della data specificata
+  Private Sub PulisciCartollaRicorsiva(ByVal cartellaDaPulire As String, ByVal dataCutoff As DateTime)
+    Try
+      If Not Directory.Exists(cartellaDaPulire) Then Return
+
+      ' Pulisco prima tutti i file nella cartella corrente
+      For Each file As String In Directory.GetFiles(cartellaDaPulire)
+        Try
+          If System.IO.File.GetCreationTime(file) <= dataCutoff Then
+            System.IO.File.Delete(file)
+            ScriviLogCustom(strLogPath, "Pulizia ricorsiva - Eliminato file: " & file)
+          End If
+        Catch exFile As Exception
+          ScriviLogCustom(strLogPath, "Errore eliminazione file ricorsiva " & file & ": " & exFile.Message)
+        End Try
+      Next
+
+      ' Poi pulisco ricorsivamente tutte le sottocartelle
+      For Each subDir As String In Directory.GetDirectories(cartellaDaPulire)
+        Try
+          ' Prima pulisco ricorsivamente il contenuto della sottocartella
+          PulisciCartollaRicorsiva(subDir, dataCutoff)
+
+          ' Poi verifico se la sottocartella è vuota e più vecchia del cutoff, in tal caso la elimino
+          If Directory.GetCreationTime(subDir) <= dataCutoff Then
+            ' Controllo se la cartella è vuota dopo la pulizia ricorsiva
+            If Directory.GetFiles(subDir).Length = 0 AndAlso Directory.GetDirectories(subDir).Length = 0 Then
+              Directory.Delete(subDir)
+              ScriviLogCustom(strLogPath, "Pulizia ricorsiva - Eliminata cartella vuota: " & subDir)
+            Else
+              ScriviLogCustom(strLogPath, "Pulizia ricorsiva - Cartella non vuota, mantenuta: " & subDir)
+            End If
+          End If
+        Catch exDir As Exception
+          ScriviLogCustom(strLogPath, "Errore eliminazione cartella ricorsiva " & subDir & ": " & exDir.Message)
+        End Try
+      Next
+     
+' ATTIVITA DI PULIZIA ---> serve perchè così l'alert
+' potrà individuare più facilmente il file da allegare via mail,
+' con questa pulizia sposto i file sotto importati\old
+' nella terminate poi metto l'ultimo file importato e sarà quello ad essere preso dall'alert
+  Dim destDir As String = Path.Combine(strImportatiDir, "OLD")
+
+  ' Creo la sottocartella OLD se non esiste
+  If Not Directory.Exists(destDir) Then
+    Directory.CreateDirectory(destDir)
+    ScriviLogCustom(strLogPath, "Creata cartella OLD in IMPORTATO_BUSINESS: " & destDir)
+  End If
+
+  ' Prendo tutti i file (esclusa la cartella OLD) e li sposto in OLD
+  For Each filePath As String In Directory.GetFiles(strImportatiDir)
+    Dim fileName As String = Path.GetFileName(filePath)
+    Dim destFilePath As String = Path.Combine(destDir, fileName)
+    Dim counter As Integer = 1
+    ' Se c'è già un file collo stesso nome, genero un nome univoco
+    While File.Exists(destFilePath)
+      destFilePath = Path.Combine(destDir, Path.GetFileNameWithoutExtension(fileName) & "_" & counter & Path.GetExtension(fileName))
+      counter += 1
+    End While
+    File.Move(filePath, destFilePath)
+    ScriviLogCustom(strLogPath, "Spostato file in OLD: " & fileName & " -> " & destFilePath)
+  Next
+
+    Catch ex As Exception
+      ScriviLogCustom(strLogPath, "Errore generale pulizia ricorsiva per " & cartellaDaPulire & ": " & ex.Message)
+    End Try
+  End Sub
+
+  ' Classe che sono stato costretto ad utilizzare per sostituire le tuple anonime - x compatibilità con .NET Framework più vecchio
+  Public Class VariazioneDettaglio
+    Public Property Variazione As Decimal
+    Public Property FileDetails As List(Of FileDettaglio)
+
+    Public Sub New()
+      FileDetails = New List(Of FileDettaglio)
+    End Sub
+  End Class
+
+  Public Class FileDettaglio
+    Public Property FileName As String
+    Public Property IndividualVariation As Decimal
+
+    Public Sub New(fileName As String, individualVariation As Decimal)
+      Me.FileName = fileName
+      Me.IndividualVariation = individualVariation
+    End Sub
+  End Class
+
+  Public Class DettaglioCompleto
+    Public Property CodiceArticolo As String
+    Public Property FileName As String
+    Public Property Variazione As Decimal
+
+    Public Sub New(codiceArticolo As String, fileName As String, variazione As Decimal)
+      Me.CodiceArticolo = codiceArticolo
+      Me.FileName = fileName
+      Me.Variazione = variazione
+    End Sub
+  End Class
+
+  Private Sub ScriviLogCustom(ByVal strLogPath As String, ByVal messaggio As String)
+    Try
+      Using writer As New StreamWriter(strLogPath, True, System.Text.Encoding.UTF8)
+        writer.WriteLine(Now.ToString("yyyy-MM-dd HH:mm:ss") & " - " & messaggio)
+      End Using
+    Catch ex As Exception
+    End Try
+  End Sub 
+  
+  
+  ' === NUOVA IMPLEMENTAZIONE: Funzione per formattazione decimali CSV ===
+' Formatta i decimali per CSV evitando troppi zeri e usando punto come separatore
+Private Function FormatDecimalForCSV(ByVal valore As Decimal) As String
+  Try
+    ' Se è un numero intero, restituisco senza decimali
+    If valore = Math.Truncate(valore) Then
+      Return valore.ToString("0", System.Globalization.CultureInfo.InvariantCulture)
+    Else
+      ' Altrimenti uso massimo 2 decimali, rimuovendo zeri finali
+      Return valore.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture)
+    End If
+  Catch ex As Exception
+    ' In caso di errore, restituisco il valore base
+    Return valore.ToString().Replace(",", ".")
+  End Try
+End Function 
